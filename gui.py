@@ -100,6 +100,8 @@ class AnalysisGUI:
         
         self._build_layout()
 
+        self.is_analyzing = False # Steuert, ob nur Vorschau oder harte KI-Analyse läuft
+
     def _build_layout(self):
         frame_top = ttk.Frame(self.root, padding=10)
         frame_top.pack(fill=tk.X)
@@ -113,6 +115,9 @@ class AnalysisGUI:
         ttk.Button(frame_top, text="Stop", command=self.stop).pack(side=tk.LEFT)
         self.btn_pause = ttk.Button(frame_top, text="Pause", command=self._toggle_pause)
         self.btn_pause.pack(side=tk.LEFT, padx=4)
+
+        self.btn_analyse_starten = ttk.Button(controls, text="🚀 Analyse Starten", command=self.start_full_analysis)
+        self.btn_analyse_starten.pack(side=tk.LEFT, padx=5)
 
         ttk.Button(frame_top, text="🎬 Export Video", command=self._export_video).pack(side=tk.LEFT, padx=(15, 4))
 
@@ -181,8 +186,6 @@ class AnalysisGUI:
         tf_ball.pack(fill=tk.X, pady=5)
         ttk.Button(tf_ball.sub_frame, text="🔳 Spieler-Box (ROI) ziehen", command=self._start_player_bbox_marking).pack(fill=tk.X, pady=2)
         ttk.Button(tf_ball.sub_frame, text="🎯 Ball manuell markieren", command=self._start_ball_tracker).pack(fill=tk.X, pady=2)
-
-        ttk.Button(tf_ball.sub_frame, text="🎯 Ball manuell markieren", command=self._start_ball_tracker).pack(fill=tk.X, pady=(0, 5))
         ttk.Button(tf_ball.sub_frame, text="Tracker zurücksetzen", command=self._reset_ball_tracker).pack(fill=tk.X, pady=(0, 5))
         ttk.Button(tf_ball.sub_frame, text="🎨 Ballfarbe sampeln", command=self._start_ball_color_sampling).pack(fill=tk.X, pady=(0, 5))
         ttk.Button(tf_ball.sub_frame, text="Farbfilter löschen", command=self._clear_ball_color_filter).pack(fill=tk.X, pady=(0, 5))
@@ -976,7 +979,7 @@ class AnalysisGUI:
         
     def run(self): 
         self.root.mainloop()
-        
+
     def export_trimmed_video(self):
         if not self.cap or not hasattr(self, 'video_path'):
             messagebox.showerror("Fehler", "Kein Video geladen.")
