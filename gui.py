@@ -179,6 +179,9 @@ class AnalysisGUI:
         
         tf_ball = ToggledFrame(self.frame_settings, text="2. Ball Filter & Tracker")
         tf_ball.pack(fill=tk.X, pady=5)
+        ttk.Button(tf_ball.sub_frame, text="🔳 Spieler-Box (ROI) ziehen", command=self._start_player_bbox_marking).pack(fill=tk.X, pady=2)
+        ttk.Button(tf_ball.sub_frame, text="🎯 Ball manuell markieren", command=self._start_ball_tracker).pack(fill=tk.X, pady=2)
+
         ttk.Button(tf_ball.sub_frame, text="🎯 Ball manuell markieren", command=self._start_ball_tracker).pack(fill=tk.X, pady=(0, 5))
         ttk.Button(tf_ball.sub_frame, text="Tracker zurücksetzen", command=self._reset_ball_tracker).pack(fill=tk.X, pady=(0, 5))
         ttk.Button(tf_ball.sub_frame, text="🎨 Ballfarbe sampeln", command=self._start_ball_color_sampling).pack(fill=tk.X, pady=(0, 5))
@@ -973,3 +976,65 @@ class AnalysisGUI:
         
     def run(self): 
         self.root.mainloop()
+        
+    def export_trimmed_video(self):
+        if not self.cap or not hasattr(self, 'video_path'):
+            messagebox.showerror("Fehler", "Kein Video geladen.")
+            return None
+
+        # 1. Neuen Dateinamen generieren (z.B. wurf.avi -> wurf_opt.avi)
+        name, ext = os.path.splitext(self.video_path)
+        opt_path = f"{name}_opt{ext}"
+        
+        # 2. VideoWriter einrichten
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Codec basierend auf Dateiendung wählen
+        fourcc = cv2.VideoWriter_fourcc(*'XVID') if ext.lower() == '.avi' else cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(opt_path, fourcc, fps, (w, h))
+
+        # 3. Frames schreiben
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+        current_f = self.start_frame
+        
+        print(f"Exportiere {opt_path} ... Bitte warten.")
+        while current_f <= self.end_frame:
+            ret, frame = self.cap.read()
+            if not ret: break
+            out.write(frame)
+            current_f += 1
+
+        out.release()
+        print("Export abgeschlossen!")
+        return opt_path
+    
+    def _start_player_bbox_marking(self):
+            if not self.last_frames:
+                messagebox.showwarning("Achtung", "Bitte lade ein Video, starte es und drücke auf Pause.")
+                return
+                
+            self.paused = True
+            self.btn_pause.configure(text="Play")
+            threading.Thread(target=self._player_bbox_thread, daemon=True).start()
+
+    def _player_bbox_thread(self):
+            clone = self.last_frames["orig"].copy()
+            win_name = "Spieler markieren (ENTER zum Bestaetigen)"
+            
+            cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+            cv2.setWindowProperty(win_name, cv2.WND_PROP_TOPMOST, 1)
+            
+            # Öffnet das OpenCV Fenster zum Zeichnen der Box
+            bbox = cv2.selectROI(win_name, clone, fromCenter=False, showCrosshair=True)
+            cv2.destroyWindow(win_name)
+            
+            if bbox and bbox[2] > 0 and bbox[3] > 0:
+                if self.engine:
+                    self.engine.set_player_bbox(bbox)
+                self.root.after(0, lambda: messagebox.showinfo("Erfolg", "Spieler-Bereich festgelegt. Analyse wird massiv beschleunigt!"))
+            else:
+                if self.engine:
+                    self.engine.set_player_bbox(None) # Zurücksetzen
+                self.root.after(0, lambda: messagebox.showinfo("Info", "Kein Bereich markiert. Es wird das gesamte Bild gescannt."))

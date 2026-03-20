@@ -304,7 +304,7 @@ class UDPoseEstimator:
         return None
 
 class BallDetector:
-    def __init__(self, mog2: Optional[cv2.BackgroundSubtractor] = None):
+    def __init__(self, mog2: Optional[Any] = None):
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         self.manual_tracker = None
         self.tracker_active = False
@@ -801,6 +801,13 @@ class AnalysisEngine:
         self.ball_cache_by_frame: Dict[int, Ball2D] = {}
         self.set_calibration_mode(calibration_mode, reset=False)
 
+        self.player_bbox: Optional[Tuple[int, int, int, int]] = None
+
+    def set_player_bbox(self, bbox: Optional[Tuple[int, int, int, int]]):
+        """Setzt den statischen Bildausschnitt für die Analyse"""
+        self.player_bbox = bbox
+        self.ball_detector.reset_background_model() # Tracker muss zurückgesetzt werden
+
     def reset_runtime_state(self) -> None:
         self.analyzer = BiomechanicsAnalyzer(fps=self.fps)
         self.per_track_state = {1: AnalysisState()}
@@ -984,26 +991,56 @@ class AnalysisEngine:
         body_height_m: Optional[float] = None,
         frame_index: Optional[int] = None,
     ) -> Tuple[Optional[FrameMetrics], Optional[Pose2D], Optional[Ball2D], Dict[str, np.ndarray], int]:
+        
         orig_frame = frame.copy()
-        pose2d = self.pose_estimator.estimate(frame, kpt_thr=kpt_thr)
+        
+        # --- NEU: Bild dynamisch zuschneiden, wenn eine Box gezogen wurde ---
+        if self.player_bbox is not None and len(self.player_bbox) == 4:
+            px, py, pw, ph = self.player_bbox
+            # Sicherstellen, dass die Box im Bild bleibt
+            px, py = max(0, px), max(0, py)
+            pw = min(frame.shape[1] - px, pw)
+            ph = min(frame.shape[0] - py, ph)
+            
+            process_frame = frame[py:py+ph, px:px+pw]
+            offset_x, offset_y = px, py
+        else:
+            process_frame = frame
+            offset_x, offset_y = 0, 0
 
-        ball, ball_mask = None, None
+        # Pose & Ball AUF DEM ZUGESCHNITTENEN BILD suchen (bringt den Speed-Boost)
+        pose2d = self.pose_estimator.estimate(process_frame, kpt_thr=kpt_thr)
+
+        ball, ball_mask_cropped = None, None
         cached_ball, cached_mask = self._get_cached_ball(frame_index, frame.shape)
         if cached_ball is not None and not self.ball_detector.tracker_active:
             ball, ball_mask = cached_ball, cached_mask
+            offset_applied = True # Cache ist immer Full-Frame
         else:
-            ball, ball_mask = self.ball_detector.detect(
-                frame,
-                s_max=s_max,
-                v_min=v_min,
-                p1=p1,
-                p2=p2,
-                roi_polygon=roi_polygon,
-                use_mog2=use_mog2,
-                min_radius=min_rad,
-                max_radius=max_rad,
+            ball, ball_mask_cropped = self.ball_detector.detect(
+                process_frame,
+                s_max=s_max, v_min=v_min, p1=p1, p2=p2,
+                roi_polygon=roi_polygon, use_mog2=use_mog2,
+                min_radius=min_rad, max_radius=max_rad,
             )
-            if ball is not None and frame_index is not None:
+            offset_applied = False
+            
+            # Maske für das Debug-Fenster wieder auf Originalgröße bringen
+            ball_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+            if ball_mask_cropped is not None:
+                bh, bw = ball_mask_cropped.shape[:2]
+                ball_mask[py:py+bh, px:px+bw] = ball_mask_cropped
+
+        # Koordinaten wieder auf das Originalbild zurückrechnen!
+        if pose2d is not None:
+            for k in pose2d.keypoints:
+                pose2d.keypoints[k][0] += offset_x
+                pose2d.keypoints[k][1] += offset_y
+                
+        if ball is not None and not offset_applied:
+            ball.center[0] += offset_x
+            ball.center[1] += offset_y
+            if frame_index is not None:
                 self._store_ball_cache(frame_index, ball)
 
         if ball_mask is None:
