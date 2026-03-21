@@ -6,3 +6,8 @@ __pycache__\
 *.pyd
 .Python
 env/
+dist/
+build/
+*.egg-info/
+.idea/
+.vscode/  

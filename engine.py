@@ -6,6 +6,7 @@ import json
 import math
 import sys
 import os
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -145,14 +146,90 @@ def optional_import(module_name: str):
     except Exception:
         return None
 
+
+def has_mediapipe_pose_support() -> bool:
+    if sys.version_info >= (3, 13):
+        return False
+    mediapipe = optional_import("mediapipe")
+    if mediapipe is None:
+        return False
+
+    try:
+        if hasattr(mediapipe, "solutions") and hasattr(mediapipe.solutions, "pose"):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if (
+            hasattr(mediapipe, "tasks")
+            and hasattr(mediapipe.tasks, "vision")
+            and hasattr(mediapipe.tasks.vision, "PoseLandmarker")
+            and hasattr(mediapipe.tasks, "BaseOptions")
+            and hasattr(mediapipe, "Image")
+        ):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _download_file(url: str, target_path: str, timeout_s: int = 20) -> bool:
+    temp_path = f"{target_path}.tmp"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as response:
+            data = response.read()
+        if not data:
+            return False
+        with open(temp_path, "wb") as fh:
+            fh.write(data)
+        os.replace(temp_path, target_path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        return False
+
+
+def ensure_pose_task_model() -> Optional[str]:
+    model_names = ("pose_landmarker.task", "pose_landmarker_lite.task")
+    search_dirs = [
+        os.path.join(os.getcwd(), "models"),
+        os.getcwd(),
+        os.path.join(os.path.expanduser("~"), ".wurfexe", "models"),
+    ]
+
+    for base_dir in search_dirs:
+        for model_name in model_names:
+            candidate = os.path.join(base_dir, model_name)
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                return candidate
+
+    target_dir = search_dirs[0]
+    os.makedirs(target_dir, exist_ok=True)
+    target_path = os.path.join(target_dir, "pose_landmarker_lite.task")
+
+    urls = (
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+    )
+
+    for url in urls:
+        if _download_file(url, target_path):
+            return target_path
+
+    return None
+
 def pick_default_pose_backend() -> str:
     mmpose_apis = optional_import("mmpose.apis")
     if mmpose_apis is not None and hasattr(mmpose_apis, "MMPoseInferencer"):
         return "mmpose"
-    if sys.version_info < (3, 13):
-        mediapipe = optional_import("mediapipe")
-        if mediapipe is not None and hasattr(mediapipe, "solutions"):
-            return "mediapipe"
+    if has_mediapipe_pose_support():
+        return "mediapipe"
     return "none"
 
 
@@ -196,7 +273,13 @@ class UDPoseEstimator:
         self.mode = "none"
         self.backend = None
         self.mp_pose = None
+        self.mp_pose_task = None
+        self.mp_image_cls = None
+        self.mp_image_format = None
         self.preferred_backend = preferred_backend
+        self.pose_temporal_alpha = 0.55
+        self.pose_max_jump_px = 140.0
+        self.prev_pose_keypoints: Dict[str, np.ndarray] = {}
 
         if preferred_backend in {"auto", "mmpose"}:
             mmpose_apis = optional_import("mmpose.apis")
@@ -212,9 +295,95 @@ class UDPoseEstimator:
         if preferred_backend in {"auto", "mediapipe"}:
             if sys.version_info < (3, 13):
                 mediapipe = optional_import("mediapipe")
-                if mediapipe is not None and hasattr(mediapipe, "solutions"):
-                    self.mp_pose = mediapipe.solutions.pose.Pose(static_image_mode=False)
-                    self.mode = "mediapipe"
+                if mediapipe is not None:
+                    if hasattr(mediapipe, "solutions") and hasattr(mediapipe.solutions, "pose"):
+                        try:
+                            self.mp_pose = mediapipe.solutions.pose.Pose(static_image_mode=False)
+                            self.mode = "mediapipe"
+                            return
+                        except Exception:
+                            self.mp_pose = None
+
+                    self._init_mediapipe_tasks(mediapipe)
+
+    def _init_mediapipe_tasks(self, mediapipe) -> None:
+        try:
+            if (
+                not hasattr(mediapipe, "tasks")
+                or not hasattr(mediapipe.tasks, "vision")
+                or not hasattr(mediapipe.tasks.vision, "PoseLandmarker")
+                or not hasattr(mediapipe.tasks, "BaseOptions")
+                or not hasattr(mediapipe, "Image")
+                or not hasattr(mediapipe, "ImageFormat")
+            ):
+                return
+
+            model_path = ensure_pose_task_model()
+            if not model_path:
+                return
+
+            pose_landmarker = mediapipe.tasks.vision.PoseLandmarker
+            options_cls = mediapipe.tasks.vision.PoseLandmarkerOptions
+            running_mode = mediapipe.tasks.vision.RunningMode
+            base_options = mediapipe.tasks.BaseOptions
+
+            options = options_cls(
+                base_options=base_options(model_asset_path=model_path),
+                running_mode=running_mode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.2,
+                min_pose_presence_confidence=0.2,
+                min_tracking_confidence=0.2,
+            )
+            self.mp_pose_task = pose_landmarker.create_from_options(options)
+            self.mp_image_cls = mediapipe.Image
+            self.mp_image_format = mediapipe.ImageFormat.SRGB
+            self.mode = "mediapipe-tasks"
+        except Exception:
+            self.mp_pose_task = None
+            self.mp_image_cls = None
+            self.mp_image_format = None
+
+    def _estimate_mediapipe_tasks(self, frame: np.ndarray, kpt_thr: float) -> Optional[Pose2D]:
+        if self.mp_pose_task is None or self.mp_image_cls is None or self.mp_image_format is None:
+            return None
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = self.mp_image_cls(image_format=self.mp_image_format, data=rgb)
+        result = self.mp_pose_task.detect(mp_image)
+        if not result or not getattr(result, "pose_landmarks", None):
+            return None
+        if not result.pose_landmarks:
+            return None
+
+        h, w = frame.shape[:2]
+        lm = result.pose_landmarks[0]
+        idx_map = {
+            "nose": 0, "left_shoulder": 11, "right_shoulder": 12,
+            "left_elbow": 13, "right_elbow": 14, "left_wrist": 15,
+            "right_wrist": 16, "left_hip": 23, "right_hip": 24,
+            "left_knee": 25, "right_knee": 26, "left_ankle": 27, "right_ankle": 28
+        }
+
+        keypoints = {}
+        for name, idx in idx_map.items():
+            if idx >= len(lm):
+                continue
+            lmk = lm[idx]
+            visibility = getattr(lmk, "visibility", 1.0)
+            presence = getattr(lmk, "presence", 1.0)
+            if visibility < kpt_thr or presence < max(0.1, kpt_thr * 0.5):
+                continue
+            x = float(lmk.x) * w
+            y = float(lmk.y) * h
+            if not (math.isfinite(x) and math.isfinite(y)):
+                continue
+            keypoints[name] = np.array([x, y], dtype=np.float32)
+
+        if len(keypoints) < 5:
+            return None
+
+        return Pose2D(keypoints=keypoints, confidence=1.0)
 
     def _estimate_mediapipe(self, frame: np.ndarray, kpt_thr: float) -> Optional[Pose2D]:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -241,6 +410,21 @@ class UDPoseEstimator:
             return None
             
         return Pose2D(keypoints=keypoints, confidence=1.0)
+
+    def _smooth_pose(self, pose: Pose2D) -> Pose2D:
+        smoothed: Dict[str, np.ndarray] = {}
+        for name, point in pose.keypoints.items():
+            curr = np.array(point, dtype=np.float32)
+            prev = self.prev_pose_keypoints.get(name)
+            if prev is not None:
+                jump = float(np.linalg.norm(curr - prev))
+                if jump <= self.pose_max_jump_px:
+                    curr = (self.pose_temporal_alpha * curr + (1.0 - self.pose_temporal_alpha) * prev).astype(np.float32)
+            smoothed[name] = curr
+
+        self.prev_pose_keypoints = {k: v.copy() for k, v in smoothed.items()}
+        pose.keypoints = smoothed
+        return pose
 
     def estimate(self, frame: np.ndarray, kpt_thr: float = 0.3) -> Optional[Pose2D]:
         if self.mode == "udp-mmpose":
@@ -294,13 +478,18 @@ class UDPoseEstimator:
                 
             if len(keypoints) < 5:
                 return None
-            return Pose2D(keypoints=keypoints, confidence=1.0)
+            return self._smooth_pose(Pose2D(keypoints=keypoints, confidence=1.0))
             
         if self.mode == "mediapipe":
             mp_pose = self._estimate_mediapipe(frame, kpt_thr)
             if mp_pose is not None:
-                return mp_pose
+                return self._smooth_pose(mp_pose)
+        if self.mode == "mediapipe-tasks":
+            mp_pose = self._estimate_mediapipe_tasks(frame, kpt_thr)
+            if mp_pose is not None:
+                return self._smooth_pose(mp_pose)
 
+        self.prev_pose_keypoints.clear()
         return None
 
 class BallDetector:
@@ -309,6 +498,8 @@ class BallDetector:
         self.manual_tracker = None
         self.tracker_active = False
         self.color_filter: Optional[Dict[str, Any]] = None
+        self.last_ball: Optional[Ball2D] = None
+        self.ball_temporal_alpha = 0.65
         self.mog2 = mog2
         
         if self.mog2 is None:
@@ -318,7 +509,7 @@ class BallDetector:
         self.mog2 = None
         if cv2 is not None and hasattr(cv2, "createBackgroundSubtractorMOG2"):
             try:
-                self.mog2 = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=25, detectShadows=False)
+                self.mog2 = cv2.createBackgroundSubtractorMOG2(history=180, varThreshold=16, detectShadows=False)
             except Exception:
                 self.mog2 = None
 
@@ -339,10 +530,24 @@ class BallDetector:
     def reset_tracker(self):
         self.manual_tracker = None
         self.tracker_active = False
+        self.last_ball = None
 
     def _pick_contours(self, mask: np.ndarray) -> List[np.ndarray]:
         contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return contours[0] if len(contours) == 2 else contours[1]
+
+    def _smooth_ball(self, ball: Ball2D) -> Ball2D:
+        if self.last_ball is None:
+            return ball
+        center = (
+            self.ball_temporal_alpha * ball.center
+            + (1.0 - self.ball_temporal_alpha) * self.last_ball.center
+        ).astype(np.float32)
+        radius = float(
+            self.ball_temporal_alpha * ball.radius
+            + (1.0 - self.ball_temporal_alpha) * self.last_ball.radius
+        )
+        return Ball2D(center=center, radius=radius, confidence=ball.confidence)
 
     def clear_color_filter(self) -> None:
         self.color_filter = None
@@ -406,15 +611,28 @@ class BallDetector:
         h, w = frame.shape[:2]
         
         if self.tracker_active and self.manual_tracker is not None:
-            ok, bbox = self.manual_tracker.update(frame)
+            # --- Tracker Update mit Sicherheitsabfrage ---
+            try:
+                ok, bbox = self.manual_tracker.update(frame)
+            except Exception as e:
+                print(f"[Warnung] OpenCV Tracker Fehler abgefangen: {e}")
+                ok = False
+                bbox = None
+                self.manual_tracker = None
+            # ---------------------------------------------
+            
             if ok:
                 x, y, bw, bh = bbox
                 center_x = x + bw / 2.0
                 center_y = y + bh / 2.0
                 radius = max(bw, bh) / 2.0
-                return Ball2D(center=np.array([center_x, center_y], dtype=np.float32), radius=float(radius), confidence=1.0), np.zeros((h, w), dtype=np.uint8)
+                tracked_ball = Ball2D(center=np.array([center_x, center_y], dtype=np.float32), radius=float(radius), confidence=1.0)
+                tracked_ball = self._smooth_ball(tracked_ball)
+                self.last_ball = tracked_ball
+                return tracked_ball, np.zeros((h, w), dtype=np.uint8)
             else:
                 self.tracker_active = False
+                self.last_ball = None
                 
         # ROI Bounding Box 
         roi_x, roi_y, roi_w, roi_h = 0, 0, w, h
@@ -426,7 +644,8 @@ class BallDetector:
             roi_x, roi_y, roi_w, roi_h = cv2.boundingRect(pts)
             cv2.fillPoly(roi_mask, [pts], 255)
 
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        frame_blur = cv2.GaussianBlur(frame, (11, 11), 0)
+        hsv = cv2.cvtColor(frame_blur, cv2.COLOR_BGR2HSV)
         best: Optional[Tuple[float, Ball2D]] = None
 
         color_mask = self._build_color_mask(hsv)
@@ -437,16 +656,30 @@ class BallDetector:
             upper = np.array([180, s_max, 255], dtype=np.uint8)
             mask = cv2.inRange(hsv, lower, upper)
 
-        # MOG2 ROI-Anwendung
+        # MOG2 ROI-Anwendung (nur verwenden, wenn die Bewegungsmaske brauchbar ist)
+        motion_mask = None
         if use_mog2 and self.mog2 is not None:
             fg_mask = self.mog2.apply(frame)
-            roi_frame = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
-            fg_mask_roi = self.mog2.apply(roi_frame)
+            _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+            fg_mask = cv2.medianBlur(fg_mask, 5)
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.kernel, iterations=1)
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, self.kernel, iterations=2)
+            if roi_mask is not None:
+                fg_mask = cv2.bitwise_and(fg_mask, roi_mask)
 
-            fg_mask = np.zeros((h, w), dtype=np.uint8)
-            fg_mask[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w] = fg_mask_roi
-
-            mask = cv2.bitwise_and(mask, fg_mask)
+            moving_px = int(cv2.countNonZero(fg_mask))
+            moving_ratio = moving_px / float(max(1, h * w))
+            if moving_px > 0 and moving_ratio < 0.70:
+                combined = cv2.bitwise_and(mask, fg_mask)
+                if cv2.countNonZero(combined) > 24:
+                    mask = combined
+                    motion_mask = fg_mask
+                elif color_mask is None and moving_px > 24:
+                    mask = fg_mask
+                    motion_mask = fg_mask
+            elif color_mask is None and moving_px > 24 and moving_ratio < 0.85:
+                mask = fg_mask
+                motion_mask = fg_mask
 
         if roi_mask is not None:
             mask = cv2.bitwise_and(mask, roi_mask)
@@ -454,6 +687,8 @@ class BallDetector:
         # Rauschen entfernen (Morphologische Operationen)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel, iterations=2)
+        mask = cv2.erode(mask, None, iterations=1)
+        mask = cv2.dilate(mask, None, iterations=1)
         
         contours_fill, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         if hierarchy is not None:
@@ -468,23 +703,76 @@ class BallDetector:
                 area = float(cv2.contourArea(cnt))
                 (x, y), radius = cv2.minEnclosingCircle(cnt)
                 
+                if area < 30.0:
+                    continue
                 if radius < min_radius or radius > max_radius:
                     continue
-                    
+
+                moments = cv2.moments(cnt)
+                if moments["m00"] <= 1e-6:
+                    continue
+                cx = float(moments["m10"] / moments["m00"])
+                cy = float(moments["m01"] / moments["m00"])
+
                 perimeter = float(cv2.arcLength(cnt, True))
                 circularity = 0.0
                 if perimeter > 1e-6:
                     circularity = 4.0 * math.pi * area / (perimeter * perimeter)
-                
-                score = area * max(0.05, circularity)
+                if circularity < 0.2:
+                    continue
+
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if bw <= 0 or bh <= 0:
+                    continue
+                aspect_ratio = float(bw) / float(max(1, bh))
+                aspect_score = max(0.2, 1.0 - min(1.0, abs(1.0 - aspect_ratio)))
+
+                motion_score = 1.0
+                if self.last_ball is not None:
+                    dist = float(np.linalg.norm(np.array([cx, cy], dtype=np.float32) - self.last_ball.center))
+                    motion_scale = max(12.0, radius * 4.0)
+                    motion_score = 1.0 / (1.0 + dist / motion_scale)
+                if motion_mask is not None:
+                    cy_i = int(max(0, min(h - 1, round(cy))))
+                    cx_i = int(max(0, min(w - 1, round(cx))))
+                    y0 = max(0, int(round(cy - radius)))
+                    y1 = min(h, int(round(cy + radius + 1)))
+                    x0 = max(0, int(round(cx - radius)))
+                    x1 = min(w, int(round(cx + radius + 1)))
+                    local_motion_ratio = 0.0
+                    if y1 > y0 and x1 > x0:
+                        local_motion = motion_mask[y0:y1, x0:x1]
+                        local_motion_ratio = float(cv2.countNonZero(local_motion)) / float(max(1, local_motion.size))
+                    if use_mog2 and roi_mask is not None and local_motion_ratio < 0.03:
+                        # Im Flugfeld statische Marker (z. B. Bodenpunkte) aussortieren.
+                        continue
+                    if motion_mask[cy_i, cx_i] > 0:
+                        motion_score *= 1.10 + min(0.7, local_motion_ratio * 2.0)
+                    else:
+                        motion_score *= 0.30 + min(0.5, local_motion_ratio * 1.5)
+
+                flight_score = 1.0
+                if roi_mask is not None and roi_h > 0:
+                    rel_y = float(cy - roi_y) / float(max(1, roi_h))
+                    rel_y = max(0.0, min(1.0, rel_y))
+                    # Flugfeld priorisiert obere Bildbereiche leicht gegenüber Boden.
+                    flight_score = max(0.25, 1.25 - rel_y)
+
+                score = area * max(0.05, circularity) * aspect_score * motion_score * flight_score
                 if best is None or score > best[0]:
                     best = (
                         score,
-                        Ball2D(center=np.array([x, y], dtype=np.float32), radius=float(radius), confidence=min(1.0, max(0.1, circularity))),
+                        Ball2D(
+                            center=np.array([cx, cy], dtype=np.float32),
+                            radius=float(radius),
+                            confidence=min(1.0, max(0.1, circularity)),
+                        ),
                     )
 
         if best is not None:
-            return best[1], mask
+            best_ball = self._smooth_ball(best[1])
+            self.last_ball = best_ball
+            return best_ball, mask
 
         # Fallback auf Hough Circles
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -505,8 +793,12 @@ class BallDetector:
         if circles is not None:
             circles = np.round(circles[0, :]).astype("int")
             x, y, r = max(circles, key=lambda c: c[2])
-            return Ball2D(center=np.array([x, y], dtype=np.float32), radius=float(r), confidence=0.3), mask
+            fallback_ball = Ball2D(center=np.array([x, y], dtype=np.float32), radius=float(r), confidence=0.3)
+            fallback_ball = self._smooth_ball(fallback_ball)
+            self.last_ball = fallback_ball
+            return fallback_ball, mask
 
+        self.last_ball = None
         return None, mask
 
 
@@ -520,7 +812,16 @@ class BiomechanicsAnalyzer:
             "knee": Kalman1D()
         }
 
-    def compute_metrics(self, pose3d: Pose3D, pose2d: Pose2D, ball: Optional[Ball2D], state: AnalysisState, current_time: float, pixels_per_meter: Optional[float] = None) -> FrameMetrics:
+    def compute_metrics(
+        self,
+        pose3d: Pose3D,
+        pose2d: Pose2D,
+        ball: Optional[Ball2D],
+        state: AnalysisState,
+        current_time: float,
+        pixels_per_meter: Optional[float] = None,
+        allow_wrist_fallback: bool = True,
+    ) -> FrameMetrics:
         kp = pose3d.keypoints
         l_sh = kp.get("left_shoulder")
         r_sh = kp.get("right_shoulder")
@@ -571,8 +872,8 @@ class BiomechanicsAnalyzer:
                     if raw_speed < 50.0:
                         speed_mps = raw_speed
 
-        # Fallback: Handgelenkgeschwindigkeit als Schätzer für Ballgeschwindigkeit.
-        if speed_mps == 0.0:
+        # Optionaler Fallback: Handgelenkgeschwindigkeit als Schätzer für Ballgeschwindigkeit.
+        if allow_wrist_fallback and speed_mps == 0.0:
             r_wr_2d = pose2d.keypoints.get("right_wrist")
             if r_wr_2d is not None and pixels_per_meter and pixels_per_meter > 0:
                 state.wrist_history.append((current_time, r_wr_2d.copy()))
@@ -990,9 +1291,12 @@ class AnalysisEngine:
         max_rad: float = 35.0,
         body_height_m: Optional[float] = None,
         frame_index: Optional[int] = None,
+        speed_start_frame: Optional[int] = None,
+        speed_end_frame: Optional[int] = None,
     ) -> Tuple[Optional[FrameMetrics], Optional[Pose2D], Optional[Ball2D], Dict[str, np.ndarray], int]:
         
         orig_frame = frame.copy()
+        px, py = 0, 0
         
         # --- NEU: Bild dynamisch zuschneiden, wenn eine Box gezogen wurde ---
         if self.player_bbox is not None and len(self.player_bbox) == 4:
@@ -1001,9 +1305,13 @@ class AnalysisEngine:
             px, py = max(0, px), max(0, py)
             pw = min(frame.shape[1] - px, pw)
             ph = min(frame.shape[0] - py, ph)
-            
-            process_frame = frame[py:py+ph, px:px+pw]
-            offset_x, offset_y = px, py
+
+            if pw > 0 and ph > 0:
+                process_frame = frame[py:py + ph, px:px + pw]
+                offset_x, offset_y = px, py
+            else:
+                process_frame = frame
+                offset_x, offset_y = 0, 0
         else:
             process_frame = frame
             offset_x, offset_y = 0, 0
@@ -1012,6 +1320,21 @@ class AnalysisEngine:
         pose2d = self.pose_estimator.estimate(process_frame, kpt_thr=kpt_thr)
 
         ball, ball_mask_cropped = None, None
+        roi_polygon_cropped = roi_polygon
+        if roi_polygon and (offset_x != 0 or offset_y != 0):
+            ph, pw = process_frame.shape[:2]
+            shifted: List[Tuple[int, int]] = []
+            for x_pt, y_pt in roi_polygon:
+                sx = int(round(x_pt - offset_x))
+                sy = int(round(y_pt - offset_y))
+                sx = max(0, min(pw - 1, sx))
+                sy = max(0, min(ph - 1, sy))
+                shifted.append((sx, sy))
+            if len(set(shifted)) >= 3:
+                roi_polygon_cropped = shifted
+            else:
+                roi_polygon_cropped = None
+
         cached_ball, cached_mask = self._get_cached_ball(frame_index, frame.shape)
         if cached_ball is not None and not self.ball_detector.tracker_active:
             ball, ball_mask = cached_ball, cached_mask
@@ -1020,7 +1343,7 @@ class AnalysisEngine:
             ball, ball_mask_cropped = self.ball_detector.detect(
                 process_frame,
                 s_max=s_max, v_min=v_min, p1=p1, p2=p2,
-                roi_polygon=roi_polygon, use_mog2=use_mog2,
+                roi_polygon=roi_polygon_cropped, use_mog2=use_mog2,
                 min_radius=min_rad, max_radius=max_rad,
             )
             offset_applied = False
@@ -1029,7 +1352,12 @@ class AnalysisEngine:
             ball_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
             if ball_mask_cropped is not None:
                 bh, bw = ball_mask_cropped.shape[:2]
-                ball_mask[py:py+bh, px:px+bw] = ball_mask_cropped
+                y1, y2 = max(0, offset_y), min(frame.shape[0], offset_y + bh)
+                x1, x2 = max(0, offset_x), min(frame.shape[1], offset_x + bw)
+                if y2 > y1 and x2 > x1:
+                    src_h = y2 - y1
+                    src_w = x2 - x1
+                    ball_mask[y1:y2, x1:x2] = ball_mask_cropped[:src_h, :src_w]
 
         # Koordinaten wieder auf das Originalbild zurückrechnen!
         if pose2d is not None:
@@ -1056,14 +1384,44 @@ class AnalysisEngine:
         metrics = None
         total_score = 0
         if pose2d is not None:
+            speed_ball = ball
+            allow_speed_by_frame = True
+            if frame_index is not None:
+                if speed_start_frame is not None and frame_index < speed_start_frame:
+                    allow_speed_by_frame = False
+                if speed_end_frame is not None and frame_index > speed_end_frame:
+                    allow_speed_by_frame = False
+
+            speed_roi_active = bool(roi_polygon and len(roi_polygon) >= 3)
+            if speed_roi_active:
+                if ball is None:
+                    speed_ball = None
+                else:
+                    roi_pts = np.array(roi_polygon, dtype=np.int32).reshape((-1, 1, 2))
+                    in_flight = cv2.pointPolygonTest(
+                        roi_pts,
+                        (float(ball.center[0]), float(ball.center[1])),
+                        False,
+                    ) >= 0
+                    if not in_flight:
+                        speed_ball = None
+            if not allow_speed_by_frame:
+                speed_ball = None
+
+            if speed_ball is None:
+                # Vor Eintritt in die Flugbahn / außerhalb Speed-Fenster keine Geschwindigkeit aufbauen.
+                self.per_track_state[1].ball_history.clear()
+                self.per_track_state[1].wrist_history.clear()
+
             pose3d = self.retargeter.retarget(Pose3D(keypoints={k: np.array([v[0], v[1], 0.0]) for k, v in pose2d.keypoints.items()}))
             metrics = self.analyzer.compute_metrics(
                 pose3d,
                 pose2d,
-                ball,
+                speed_ball,
                 self.per_track_state[1],
                 current_time,
                 pixels_per_meter=self.pixels_per_meter,
+                allow_wrist_fallback=False,
             )
             self.per_track_state[1].metrics.append(metrics)
             _, _, _, total_score = calculate_phase_scores(self.per_track_state[1].metrics, target_speed)
@@ -1090,6 +1448,28 @@ class AnalysisEngine:
                 cv2.putText(final_frame, "v= -- (Auto-Kalibrierung laeuft)", (18, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 140, 255), 2)
             else:
                 cv2.putText(final_frame, "v= -- (Referenzlinie setzen)", (18, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            def _fmt_angle(val: float) -> str:
+                return "--" if math.isnan(val) else f"{val:.1f}"
+
+            cv2.putText(
+                final_frame,
+                f"Rumpf: {_fmt_angle(metrics.trunk_inclination_deg)}  Schulter: {_fmt_angle(metrics.shoulder_angle_deg)}",
+                (18, 102),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (220, 220, 220),
+                2,
+            )
+            cv2.putText(
+                final_frame,
+                f"Ellbogen: {_fmt_angle(metrics.elbow_angle_deg)}  Knie: {_fmt_angle(metrics.knee_angle_deg)}",
+                (18, 130),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (220, 220, 220),
+                2,
+            )
 
         debug_frames = {
             "orig": orig_frame,
